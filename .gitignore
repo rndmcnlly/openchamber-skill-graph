@@ -1,4 +1,5 @@
 node_modules/
+.DS_Store
 panel/main.js
 dist/
 .openchamber/
