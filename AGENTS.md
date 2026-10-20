@@ -12,12 +12,17 @@ docs. `docs/skill-graph.png` shows an illustrative library in the actual UI.
 
 - `graph.ts`: discovery, exposure, reference extraction, diagnostics and
   reachability over a `SkillFiles` adapter. Preserve file/line/text provenance.
+  `projectSources` orders active-directory compatibility, native global and
+  native project roots by V2 precedence. Multi-source graphs qualify paths,
+  retain effective IDs and record overridden definitions in the inspector.
 - `panel/main.ts`, `panel/styles.css`, `panel/index.html`: SVG graph, controls,
   inspector and polling. Use SDK controls and host theme variables.
 - `report.ts`: read-only Node adapter and CLI (`node report.ts [--deep] [--json]
   [root]`). Tests must not require a developer's personal skills to exist.
 - `dev.mjs`: local preview at `http://127.0.0.1:4317/`. `SKILL_GRAPH_ROOT=/dir`
-  previews another library. Never package it as runtime extension code.
+  previews another global library; `SKILL_GRAPH_PROJECT=/dir` adds project
+  sources. Both adapters enforce filesystem boundaries. Never package it as
+  runtime extension code.
 - `build.mjs` and `package.mjs`: esbuild bundle and runtime-only ZIP with checksum.
   Generated bundles, dependencies, browser artifacts and `dist/` stay out of git.
 
@@ -56,6 +61,14 @@ skills. Naming mismatches are warnings under V2, not proof of a loading failure.
 Diagnostic subjects may be files or nested folders rather than skill nodes; their
 inspector paths must handle that without assuming every subject is a stray folder.
 
+Project scope is the active host directory, not an inferred repository ancestor.
+Do not claim full OpenCode runtime parity: ancestor sources outside the host
+boundary, global compatibility roots, config sources/catalogs, built-ins and
+agent permission rules remain outside this extension's scan. Missing optional
+source roots are normal; never suppress permission or nested read errors as
+though the source were simply absent. Cross-source ID mentions resolve against
+effective definitions; overridden bodies do not contribute relations.
+
 ## UI behavior
 
 - Wide mode: independent inspector scrolling, graph drag-to-pan and wheel zoom.
@@ -64,16 +77,26 @@ inspector paths must handle that without assuming every subject is a stray folde
   zoom. Do not restore auto-height on both html/body under a clipped iframe root.
 - Preserve keyboard focus when inspector or legend controls are recreated.
 - Refreshes must honor the latest Nested setting even if a build is already busy.
+- Subscribe to host directory changes as well as ready snapshots. Clear graph
+  and selection immediately on a directory change; discard stale results and
+  failures by context version, including A → B → A switches with Watch disabled.
+- Scope color is independent of exposed/hidden fill. Keep labeled scope badges
+  and legend keys. Scope uses a light/dark blue–orange categorical palette, not
+  host primary/info tokens (which can both be blue). Check perceptual separation
+  and label contrast in both themes, not just color inequality. Keep only the
+  rail panel entry; the host provides maximize.
 - Watch polls every five seconds while visible; do not add a service merely to
   watch files. SDK 2.5.0 has no file-watch subscription.
 
 ## Permissions and installation
 
-The manifest allows filesystem access only to `~/.config/opencode/skills` and
-`~/.config/opencode/skills/**`. Both patterns are needed to list the root itself.
-The grant technically includes writes; keep the panel read-only. Do not add broad
-home access or a service to avoid sandbox restrictions. The host rejects symlinks
-escaping the approved tree. Local previews should enforce comparable boundaries.
+The manifest allows global filesystem access only to `~/.config/opencode/skills`
+and `~/.config/opencode/skills/**`. Both patterns are needed to list the root
+itself. The `files` capability separately allows project-relative reads, bounded
+by the active host directory. These grants technically include writes; keep the
+panel read-only. Do not add broad home access or a service to avoid sandbox
+restrictions. The host rejects symlinks escaping the approved boundaries. Local
+previews should enforce comparable boundaries.
 
 Install through Settings → Extensions → Add. On OpenChamber 2.5.0 the Settings UI
 uses `POST /api/guests` with `{"path":"<absolute folder>"}`, then

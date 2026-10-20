@@ -1,13 +1,13 @@
 import { connectHost, HostRequestError } from "@openchamber/sdk"
 import { applyHostReady, applyHostTheme, mountBanner, mountButton, mountSearchField, mountSwitch, type BannerHandle } from "@openchamber/sdk/ui"
-import { buildGraph, edgeClass, fingerprint, reachability, SKILLS_ROOT, type Diagnostic, type EdgeClass, type Evidence, type Graph, type Relation, type Severity, type Skill, type SkillFiles } from "../graph.ts"
+import { buildGraph, edgeClass, sourcesFingerprint, projectSources, reachability, SKILLS_ROOT, type Diagnostic, type EdgeClass, type Evidence, type Graph, type Relation, type Severity, type Skill, type SkillFiles } from "../graph.ts"
 
 // Outside an iframe (npm run dev) the page reads through dev.mjs instead of the host.
 const embedded = window.parent !== window
 const host = connectHost()
 async function dev(op: string, path: string) {
   const response = await fetch(`/__fs?op=${op}&path=${encodeURIComponent(path)}`)
-  if (!response.ok) throw new Error(await response.text())
+  if (!response.ok) throw Object.assign(new Error(await response.text()), { code: response.headers.get("X-Error-Code") })
   return response.json()
 }
 const files: SkillFiles = embedded ? {
@@ -46,6 +46,8 @@ let refreshPending = false
 let lastFingerprint = ""
 let viewBox = { x: -500, y: -500, w: 1000, h: 1000 }
 let fittedFor = ""
+let directory: string | null = null
+let contextVersion = 0
 
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!
 const svgRoot = $<SVGSVGElement>("#graph")
@@ -103,9 +105,9 @@ function savePrefs() { if (embedded) void host.storage.set("prefs", prefs).catch
 
 function explain(error: unknown) {
   if (error instanceof HostRequestError) {
-    if (error.code === "NOT_GRANTED") return "Approve this extension's filesystem access in Settings → Extensions."
-    if (error.code === "BAD_PATH") return `The host refused a path under ${SKILLS_ROOT}. It must match the package's filesystem patterns and contain no symlink leading out of that tree.`
-    if (error.code === "NOT_FOUND") return `${SKILLS_ROOT} does not exist on the connected server.`
+    if (error.code === "NOT_GRANTED") return "Approve this extension's project files and global filesystem access in Settings → Extensions."
+    if (error.code === "BAD_PATH") return "The host refused a skill path. Project paths must stay inside the active directory; global paths must match the approved skills tree. Symlinks cannot escape those boundaries."
+    if (error.code === "NOT_FOUND") return "A skill file or folder disappeared during the scan. Try Refresh."
     return `${error.code}: ${error.message}`
   }
   return error instanceof Error ? error.message : String(error)
@@ -120,12 +122,14 @@ async function refresh() {
     do {
       refreshPending = false
       const deep = prefs.deep
+      const version = contextVersion
+      const sources = projectSources(directory)
       try {
-        const nextFingerprint = await fingerprint(files, SKILLS_ROOT, deep)
-        const nextGraph = await buildGraph(files, { deep })
+        const nextFingerprint = await sourcesFingerprint(files, sources, deep)
+        const nextGraph = await buildGraph(files, { deep, sources })
         // A scope toggle during either read must not publish a stale graph, even
         // with Watch off. Coalesce queued requests into one follow-up read.
-        if (deep !== prefs.deep) { refreshPending = true; continue }
+        if (deep !== prefs.deep || version !== contextVersion) { refreshPending = true; continue }
         graph = nextGraph
         lastFingerprint = nextFingerprint
         skills = new Map(graph.skills.map((skill) => [skill.id, skill]))
@@ -140,6 +144,8 @@ async function refresh() {
         showBanner("info", "")
         render()
       } catch (error) {
+        if (version !== contextVersion || deep !== prefs.deep) { refreshPending = true; continue }
+        clearGraph()
         showBanner("error", "Could not read skills", explain(error))
         summary.textContent = ""
       }
@@ -154,9 +160,32 @@ async function refresh() {
 // frame is hidden.
 setInterval(async () => {
   if (!prefs.watch || loading || !graph || document.hidden) return
-  try { if (await fingerprint(files, SKILLS_ROOT, prefs.deep) !== lastFingerprint) await refresh() }
+  const version = contextVersion
+  try { if (await sourcesFingerprint(files, projectSources(directory), prefs.deep) !== lastFingerprint && version === contextVersion) await refresh() }
   catch { /* the next manual refresh reports the error */ }
 }, 5000)
+
+function clearGraph() {
+  graph = null
+  selection = null
+  skills.clear()
+  chains.clear()
+  issues.clear()
+  lastFingerprint = ""
+  fittedFor = ""
+  svgRoot.replaceChildren()
+  inspector.replaceChildren()
+  legend.replaceChildren()
+}
+
+function setDirectory(next: string | null) {
+  if (directory === next) return
+  directory = next
+  contextVersion++
+  clearGraph()
+  showBanner("info", "")
+  if (started) void refresh()
+}
 
 // ---- Layout ----------------------------------------------------------------
 
@@ -240,6 +269,8 @@ function renderLegend() {
   const key = (glyph: string, label: string, title: string) => { const span = html("span", "legend-key", "", nodes); span.title = title; html("span", `glyph ${glyph}`, "", span); html("span", "", label, span) }
   key("exposed", "Exposed", "Listed to the model: has a description and no hiding flag")
   key("hidden", "Hidden", "Not listed to the model; still loadable by exact ID")
+  key("global", "Global", "From the server's global OpenCode skills folder")
+  key("project", "Project", "From the active directory's project skills folders")
   key("stack", "Has other files", "The skill folder holds files besides its definition")
   key("issue", "Diagnostics", "Red ring: error. Amber ring: warning")
   key("unreachable", "Unreachable", "Hidden, and no recorded reference chain from an exposed skill")
@@ -256,6 +287,8 @@ function renderSummary() {
   const scope = graph.deep ? `SKILL.md plus nested Markdown (${graph.filesScanned} files)` : "SKILL.md only"
   const time = new Date(graph.builtAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
   summary.textContent = `${graph.skills.length} skills · ${exposed} exposed · ${graph.skills.length - exposed} hidden · ${plural(graph.relations.length, "relation")} · ${attention ? `${attention} need${attention === 1 ? "s" : ""} attention (${plural(errors, "error")}, ${plural(warnings, "warning")})` : "no problems found"} · ${scope} · read ${time}${prefs.watch ? " · watching" : ""}`
+  const projectCount = graph.skills.filter((skill) => skill.scope === "project").length
+  summary.textContent += ` · ${projectCount} project / ${graph.skills.length - projectCount} global · ${directory ? `Directory: ${directory}` : "No project open: global only"}`
 }
 
 function renderGraph() {
@@ -313,8 +346,8 @@ function renderGraph() {
     const unreachable = !!item.skill && chains.get(item.key) === null
     const selected = item.key === selectedKey
     const dim = (selection && !selected && !neighbors.has(item.key)) || (query && !matches(item)) || (prefs.problemsOnly && !selected && !neighbors.has(item.key) && !hasProblem(item.key))
-    const classes = ["node", item.folder ? "folder" : item.exposed ? "exposed" : "hidden", item.skill?.extraFiles.length ? "stacked" : "", severity && severity !== "info" ? `issue-${severity}` : "", unreachable ? "unreachable" : "", selected ? "selected" : "", neighbors.has(item.key) ? "neighbor" : "", (query && matches(item)) || (prefs.problemsOnly && hasProblem(item.key)) ? "match" : "", dim ? "dim" : ""]
-    const description = item.folder ? "folder without SKILL.md" : `${item.exposed ? "exposed" : "hidden"} skill${item.skill?.extraFiles.length ? `, ${plural(item.skill.extraFiles.length, "other file")}` : ""}${severity && severity !== "info" ? `, has ${severity}s` : ""}${unreachable ? ", unreachable" : ""}`
+    const classes = ["node", item.skill?.scope ?? "global", item.folder ? "folder" : item.exposed ? "exposed" : "hidden", item.skill?.extraFiles.length ? "stacked" : "", severity && severity !== "info" ? `issue-${severity}` : "", unreachable ? "unreachable" : "", selected ? "selected" : "", neighbors.has(item.key) ? "neighbor" : "", (query && matches(item)) || (prefs.problemsOnly && hasProblem(item.key)) ? "match" : "", dim ? "dim" : ""]
+    const description = item.folder ? "folder without SKILL.md" : `${item.skill?.scope ?? "global"}, ${item.exposed ? "exposed" : "hidden"} skill${item.skill?.extraFiles.length ? `, ${plural(item.skill.extraFiles.length, "other file")}` : ""}${severity && severity !== "info" ? `, has ${severity}s` : ""}${unreachable ? ", unreachable" : ""}`
     const group = svg("g", { class: classes.filter(Boolean).join(" "), "data-key": item.key, tabindex: 0, role: "button", "aria-label": `${item.label}, ${description}`, "aria-pressed": String(selected) }, nodeLayer)
     const r = item.exposed ? 11 : 7
     if (item.folder) svg("rect", { x: point.x - 6, y: point.y - 6, width: 12, height: 12, rx: 2, class: "shape" }, group)
@@ -403,7 +436,7 @@ function select(next: Selection) {
 
 function skillButton(id: string, parent: Element) {
   const skill = skills.get(id)
-  const button = html("button", `skill-link ${skill?.exposed ? "exposed" : "hidden"}`, id, parent)
+  const button = html("button", `skill-link ${skill?.scope ?? "global"} ${skill?.exposed ? "exposed" : "hidden"}`, id, parent)
   button.type = "button"
   button.title = skill?.description ?? id
   button.onclick = () => select(skill ? { kind: "skill", id } : graph?.strayFolders.some((folder) => folder.path === id) ? { kind: "folder", path: id } : { kind: "subject", subject: id })
@@ -424,7 +457,8 @@ function locationButton(file: string, line: number | undefined, parent: Element)
   const button = html("button", "location", text, parent)
   button.type = "button"
   button.title = "Copy absolute path"
-  button.onclick = () => void copy(`${SKILLS_ROOT}/${text}`)
+  const absolute = file.startsWith("/") || file.startsWith("~") ? text : graph?.sources ? `${directory}/${text}` : `${graph?.root ?? SKILLS_ROOT}/${text}`
+  button.onclick = () => void copy(absolute)
   return button
 }
 
@@ -537,7 +571,8 @@ function renderOverview() {
     diagnosticList(notes, more, true)
   }
   html("h2", "spaced", "Skills", inspector)
-  html("p", "muted", `Read from ${g.root} using OpenCode V2 discovery: root-level *.md files and SKILL.md at any depth; the path sets the ID. Relations come only from exact text: backticked skill IDs outside code fences, and Markdown links or paths (also inside fences) that resolve into another skill's folder. ${g.deep ? "Nested Markdown files are scanned too and attributed to their skill." : "Only definition files are scanned; turn on Nested to include reference files."} Nothing is inferred by a model.`, inspector)
+  html("p", "muted", `Read from ${g.sources?.map((source) => source.root).join(", ") ?? g.root} using OpenCode V2 discovery: root-level *.md files and SKILL.md at any depth; the path sets the ID. Relations come only from exact text: backticked skill IDs outside code fences, and Markdown links or paths (also inside fences) that resolve into another skill's folder. ${g.deep ? "Nested Markdown files are scanned too and attributed to their skill." : "Only definition files are scanned; turn on Nested to include reference files."} Nothing is inferred by a model.`, inspector)
+  html("p", "muted", "Scope: active-directory project folders and the global OpenCode folder only. Ancestors outside this directory, global compatibility folders, configured sources/catalogs, built-ins and agent permission rules are not inspected. Overrides apply only among scanned sources.", inspector)
   const incoming = new Map<string, number>()
   for (const relation of g.relations) incoming.set(relation.target, (incoming.get(relation.target) ?? 0) + 1)
   for (const exposed of [true, false]) {
@@ -548,6 +583,7 @@ function renderOverview() {
     for (const skill of list) {
       const li = html("li", "", "", ul)
       skillButton(skill.id, li)
+      badge(skill.scope === "project" ? "Project" : "Global", skill.scope ?? "global", li)
       html("span", "muted count", `${incoming.get(skill.id) ?? 0} in`, li)
       if (skill.extraFiles.length) html("span", "muted count", `+${plural(skill.extraFiles.length, "file")}`, li)
       const severity = worst(skill.id)
@@ -560,6 +596,7 @@ function renderOverview() {
 function renderSkill(skill: Skill) {
   const head = header(skill.id)
   badge(skill.exposed ? "Exposed" : "Hidden", skill.exposed ? "primary" : "neutral", head)
+  badge(skill.scope === "project" ? "Project" : "Global", skill.scope ?? "global", head)
   const chain = chains.get(skill.id)
   if (chain === null) badge("Unreachable", "warning", head)
   html("p", "", skill.description || "No description.", inspector)
@@ -567,6 +604,8 @@ function renderSkill(skill: Skill) {
   const fact = (term: string, value: string | Element) => { html("dt", "", term, facts); const dd = html("dd", "", "", facts); if (typeof value === "string") dd.textContent = value; else dd.append(value) }
   if (skill.name !== skill.id) fact("Display name", skill.name ?? "(none)")
   fact("Exposure", skill.exposureReason)
+  if (skill.sourceRoot) fact("Source", skill.sourceRoot)
+  if (skill.overrides?.length) fact("Overrides", skill.overrides.join(", "))
   fact("File", locationButton(skill.file, undefined, document.createElement("span")))
   if (chain && chain.length > 1) {
     const span = html("span", "chain")
@@ -634,12 +673,18 @@ async function start() {
     switches.hidden.update({ checked: prefs.showHidden })
     switches.deep.update({ checked: prefs.deep })
     switches.watch.update({ checked: prefs.watch })
-  } else applyHostTheme(DEV_THEME as Parameters<typeof applyHostTheme>[0], document.documentElement)
+  } else {
+    applyHostTheme(DEV_THEME as Parameters<typeof applyHostTheme>[0], document.documentElement)
+    const context = await fetch("/__context").then((response) => response.json()) as { directory: string | null }
+    directory = context.directory
+  }
   await refresh()
 }
 let started = false
 host.onReady((context) => {
   applyHostReady(context, document.documentElement)
+  setDirectory(context.directory)
   if (!started) { started = true; void start() }
 })
+host.onDirectory(setDirectory)
 if (!embedded) { started = true; void start() }

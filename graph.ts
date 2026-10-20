@@ -9,6 +9,17 @@ import { parse as parseYaml } from "yaml"
 
 export const SKILLS_ROOT = "~/.config/opencode/skills"
 
+export type SkillSource = { root: string; scope: "global" | "project"; optional?: boolean }
+// Ordered from lower to higher V2 precedence. Relative paths use the host's
+// current directory, never an absolute path into a different project.
+export function projectSources(directory: string | null): SkillSource[] {
+  return [
+    ...(directory ? [".claude/skills", ".agents/skills"].map((root) => ({ root, scope: "project" as const, optional: true })) : []),
+    { root: SKILLS_ROOT, scope: "global", optional: true },
+    ...(directory ? [{ root: ".opencode/skills", scope: "project" as const, optional: true }] : []),
+  ]
+}
+
 export type Entry = { name: string; kind: "file" | "directory" | "other" }
 export type FileStat = { kind: string; size: number; mtime: number }
 export interface SkillFiles {
@@ -32,6 +43,9 @@ export type Diagnostic = { severity: Severity; code: string; subject: string; me
 
 export type Skill = {
   id: string
+  scope?: "global" | "project"
+  sourceRoot?: string
+  overrides?: string[]
   file: string
   folder: string
   name: string | null
@@ -44,6 +58,7 @@ export type Skill = {
 }
 export type Graph = {
   root: string
+  sources?: SkillSource[]
   deep: boolean
   skills: Skill[]
   relations: Relation[]
@@ -113,7 +128,7 @@ function snippetAround(line: string, index: number) {
 }
 
 // What the scanner needs to know about the tree it is reading.
-export type Tree = { ids: ReadonlySet<string>; paths: ReadonlySet<string>; ownerOf: (path: string) => string | null }
+export type Tree = { ids: ReadonlySet<string>; paths: ReadonlySet<string>; ownerOf: (path: string) => string | null; globalRoot?: string; roots?: string[] }
 
 export type Found =
   | { type: "relation"; target: string; kind: RelationKind; evidence: Evidence }
@@ -129,6 +144,7 @@ export function extractReferences(owner: string, file: string, text: string, tre
   const classify = (raw: string, evidence: Evidence) => {
     const resolved = raw.replace(/[.,:;]+$/, "").replace(/\/+$/, "")
     if (!resolved) return
+    if (tree.roots && !tree.roots.some((root) => within(resolved, root))) return
     evidence.missing = !tree.paths.has(resolved) || undefined
     const target = tree.ownerOf(resolved)
     if (target === owner) found.push({ type: "internal", evidence })
@@ -161,7 +177,11 @@ export function extractReferences(owner: string, file: string, text: string, tre
         const absolute = [...target.matchAll(ABSOLUTE)][0]
         if (absolute?.[0] === target) {
           const resolved = resolveInRoot("", absolute[1])
-          if (resolved !== null) classify(resolved, evidence("markdown-link", raw, match.index))
+          if (resolved !== null) classify(tree.globalRoot ? `${tree.globalRoot}/${resolved}` : resolved, evidence("markdown-link", raw, match.index))
+          continue
+        }
+        if ((target.startsWith("/") || target.startsWith("~")) && tree.roots?.some((root) => target.startsWith(`${root}/`))) {
+          classify(target, evidence("markdown-link", raw, match.index))
           continue
         }
         if (!target || /^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("/") || target.startsWith("~")) continue
@@ -171,7 +191,7 @@ export function extractReferences(owner: string, file: string, text: string, tre
     }
     for (const match of rest.matchAll(ABSOLUTE)) {
       mask(match.index, match[0].length)
-      classify(match[1], evidence("absolute-path", match[0], match.index))
+      classify(tree.globalRoot ? `${tree.globalRoot}/${match[1]}` : match[1], evidence("absolute-path", match[0], match.index))
     }
     for (const match of rest.matchAll(RELATIVE)) {
       mask(match.index, match[0].length)
@@ -200,10 +220,10 @@ const SKIP_DIRECTORIES = new Set(["node_modules", "__pycache__"])
 
 // Every file and folder under the root, relative to it. Dot entries and
 // dependency caches are skipped; that is this tool's choice, not OpenCode's.
-export async function walk(files: SkillFiles, root: string): Promise<{ files: string[]; folders: string[] }> {
+export async function walk(files: SkillFiles, root: string, rootEntries?: Entry[]): Promise<{ files: string[]; folders: string[] }> {
   const result = { files: [] as string[], folders: [] as string[] }
   const visit = async (folder: string, depth: number): Promise<void> => {
-    const entries = (await files.listDir(folder ? `${root}/${folder}` : root)).filter((entry) => !entry.name.startsWith("."))
+    const entries = (folder ? await files.listDir(`${root}/${folder}`) : rootEntries ?? await files.listDir(root)).filter((entry) => !entry.name.startsWith("."))
     const children: string[] = []
     for (const entry of entries) {
       const path = folder ? `${folder}/${entry.name}` : entry.name
@@ -218,7 +238,7 @@ export async function walk(files: SkillFiles, root: string): Promise<{ files: st
   return result
 }
 
-type Definition = { id: string; file: string; folder: string }
+type Definition = { id: string; file: string; folder: string; source?: SkillSource; overrides?: string[]; relativeFolder?: string }
 
 // V2 rules: root-level *.md (ID = file name) and SKILL.md at any depth (ID =
 // its folder name; a root-level SKILL.md gets the literal ID "SKILL").
@@ -239,37 +259,70 @@ export async function fingerprint(files: SkillFiles, root = SKILLS_ROOT, deep = 
   return [...tree.folders, ...tree.files, ...watched.map((file, index) => `${file}@${stats[index].mtime}:${stats[index].size}`)].join("|")
 }
 
-export async function buildGraph(files: SkillFiles, options: { root?: string; deep?: boolean } = {}): Promise<Graph> {
+async function sourceTree(files: SkillFiles, source: SkillSource) {
+  // Only an absent source root is optional. Permission failures, escaping
+  // symlinks and failures inside a source must remain visible to the user.
+  let entries: Entry[]
+  try { entries = await files.listDir(source.root) }
+  catch (error) {
+    const code = (error as { code?: string }).code
+    if (source.optional && (code === "NOT_FOUND" || code === "ENOENT")) return { files: [], folders: [] }
+    throw error
+  }
+  return walk(files, source.root, entries)
+}
+
+export async function sourcesFingerprint(files: SkillFiles, sources: SkillSource[], deep = false): Promise<string> {
+  return (await Promise.all(sources.map(async (source) => {
+    const tree = await sourceTree(files, source)
+    const watched = deep ? tree.files.filter((file) => file.endsWith(".md")) : definitions(tree.files).map((item) => item.file)
+    const stats = await mapLimit(watched, 16, (file) => files.stat(`${source.root}/${file}`))
+    return `${source.root}:${[...tree.folders, ...tree.files, ...watched.map((file, i) => `${file}@${stats[i].mtime}:${stats[i].size}`)].join("|")}`
+  }))).join("\n")
+}
+
+export async function buildGraph(files: SkillFiles, options: { root?: string; deep?: boolean; sources?: SkillSource[] } = {}): Promise<Graph> {
   const root = options.root ?? SKILLS_ROOT
   const deep = options.deep ?? false
-  const tree = await walk(files, root)
+  const sources = options.sources
+  const trees = sources ? await Promise.all(sources.map(async (source) => ({ source, tree: await sourceTree(files, source) }))) : [{ source: { root, scope: "global" as const }, tree: await walk(files, root) }]
+  const qualify = (source: SkillSource, file: string) => sources ? `${source.root}/${file}` : file
+  const tree = { files: trees.flatMap(({ source, tree }) => tree.files.map((file) => qualify(source, file))), folders: trees.flatMap(({ source, tree }) => tree.folders.map((file) => qualify(source, file))) }
   const diagnostics: Diagnostic[] = []
-  const all = definitions(tree.files)
-  // Duplicate IDs: keep the first by path and report the rest.
+  const all: Definition[] = trees.flatMap(({ source, tree }) => definitions(tree.files).map((def) => ({ ...def, relativeFolder: def.folder, source, file: qualify(source, def.file), folder: def.folder ? qualify(source, def.folder) : "" })))
+  // Within a source retain the first path and report duplicate IDs. Across
+  // sources, later sources override earlier ones in V2 registration order.
   const defs: Definition[] = []
   for (const definition of all) {
     const first = defs.find((item) => item.id === definition.id)
-    if (first) diagnostics.push({ severity: "error", code: "duplicate-id", subject: first.id, file: definition.file, message: `${definition.file} also derives ID "${definition.id}" (first: ${first.file}). Only one can be loaded; this graph shows the first.` })
+    if (first && sources && first.source?.root !== definition.source!.root) {
+      definition.overrides = [...(first.overrides ?? []), first.file]
+      defs.splice(defs.indexOf(first), 1, definition)
+      diagnostics.push({ severity: "info", code: "source-override", subject: definition.id, file: definition.file, message: `${definition.file} overrides ${first.file} for ID "${definition.id}". The graph shows the higher-precedence definition.` })
+    }
+    else if (first) diagnostics.push({ severity: "error", code: "duplicate-id", subject: first.id, file: definition.file, message: `${definition.file} also derives ID "${definition.id}" (first: ${first.file}). Only one can be loaded; this graph shows the first.` })
     else defs.push(definition)
   }
   const ids = new Set(defs.map((definition) => definition.id))
-  // Deepest skill folder that contains a path owns it.
-  const byDepth = [...defs].filter((definition) => definition.folder).sort((a, b) => b.folder.length - a.folder.length)
-  const ownerOf = (path: string) => defs.find((definition) => !definition.folder && definition.file === path)?.id ?? byDepth.find((definition) => within(path, definition.folder))?.id ?? null
-  const scanTree: Tree = { ids, paths: new Set([...tree.files, ...tree.folders]), ownerOf }
+  // Physical ownership includes overridden definitions: their files must not
+  // become the parent's supporting Markdown just because another source wins.
+  const byDepth = [...all].filter((definition) => definition.folder).sort((a, b) => b.folder.length - a.folder.length)
+  const ownerOf = (path: string) => all.find((definition) => !definition.folder && definition.file === path)?.id ?? byDepth.find((definition) => within(path, definition.folder))?.id ?? null
+  const scanTree: Tree = { ids, paths: new Set([...tree.files, ...tree.folders]), ownerOf, ...(sources ? { globalRoot: SKILLS_ROOT, roots: sources.map((source) => source.root) } : {}) }
 
   for (const file of tree.files) {
-    if (file.includes("/") && basename(file) !== "SKILL.md" && basename(file).toLowerCase() === "skill.md") diagnostics.push({ severity: "error", code: "skill-md-case", subject: dirname(file), file, message: `${file} is not named exactly SKILL.md, so OpenCode does not load it.` })
+    const relative = sources ? file.slice(sources.find((source) => file.startsWith(`${source.root}/`))!.root.length + 1) : file
+    if (relative.includes("/") && basename(file) !== "SKILL.md" && basename(file).toLowerCase() === "skill.md") diagnostics.push({ severity: "error", code: "skill-md-case", subject: dirname(file), file, message: `${file} is not named exactly SKILL.md, so OpenCode does not load it.` })
   }
   for (const definition of defs) {
     if (!definition.folder && definition.id !== "SKILL") diagnostics.push({ severity: "info", code: "root-markdown", subject: definition.id, file: definition.file, message: `Root-level Markdown defines skill "${definition.id}" in V2. Intended?` })
-    if (definition.folder.includes("/")) {
+    if (definition.relativeFolder?.includes("/")) {
       const parent = byDepth.find((other) => other !== definition && within(definition.folder, other.folder))
       diagnostics.push({ severity: "warning", code: "nested-skill", subject: definition.id, file: definition.file, message: `Nested SKILL.md registers its own ID "${definition.id}"${parent ? ` inside ${parent.id}'s folder` : ""}.` })
     }
   }
-  const topFolders = tree.folders.filter((folder) => !folder.includes("/"))
-  const strayFolders = topFolders.filter((folder) => !defs.some((definition) => within(definition.folder, folder))).map((path) => ({ path, files: tree.files.filter((file) => within(file, path)) }))
+  const topFolders = trees.flatMap(({ source, tree }) => tree.folders.filter((folder) => !folder.includes("/")).map((folder) => qualify(source, folder)))
+  const strayFolders = topFolders.filter((folder) => !all.some((definition) => within(definition.folder, folder))).map((path) => ({ path, files: tree.files.filter((file) => within(file, path)) }))
   for (const folder of strayFolders) diagnostics.push({ severity: "error", code: "missing-skill-md", subject: folder.path, message: `Folder ${folder.path}/ has no SKILL.md, so it defines no skill${folder.files.length ? ` (${folder.files.length} file${folder.files.length === 1 ? "" : "s"} inside)` : " (empty)"}.` })
 
   const relations = new Map<string, Relation>()
@@ -279,7 +332,7 @@ export async function buildGraph(files: SkillFiles, options: { root?: string; de
     const owned = folder ? tree.files.filter((path) => within(path, folder) && ownerOf(path) === id) : [file]
     const extraFiles = owned.filter((path) => path !== file)
     const scannedFiles = [file, ...(deep ? extraFiles.filter((path) => path.endsWith(".md")) : [])]
-    const text = await files.readFile(`${root}/${file}`)
+    const text = await files.readFile(sources ? file : `${root}/${file}`)
     const front = splitFrontmatter(text)
     const report = (severity: Severity, code: string, message: string, line?: number) => diagnostics.push({ severity, code, subject: id, file, line, message })
     if (!front.present) report("warning", "missing-frontmatter", "No YAML frontmatter. V2 accepts this but cannot advertise the skill without a description; V1 and the Agent Skills spec require name and description.", 1)
@@ -297,7 +350,7 @@ export async function buildGraph(files: SkillFiles, options: { root?: string; de
     if (exposure.invalidFlag !== undefined) report("warning", "autoinvoke-value", `metadata.opencode/autoinvoke is ${JSON.stringify(exposure.invalidFlag)}; only true, false, "true", or "false" are meaningful.`)
     const internalRefs: Evidence[] = []
     for (const path of scannedFiles) {
-      const content = path === file ? text : await files.readFile(`${root}/${path}`)
+      const content = path === file ? text : await files.readFile(sources ? path : `${root}/${path}`)
       filesScanned++
       for (const item of extractReferences(id, path, content, scanTree)) {
         if (item.evidence.missing) diagnostics.push({ severity: "info", code: "missing-target", subject: id, file: path, line: item.evidence.line, message: `${item.evidence.match} points at a path that does not exist${item.type === "relation" ? ` in ${item.target}` : ""} (possibly an example placeholder).` })
@@ -311,12 +364,12 @@ export async function buildGraph(files: SkillFiles, options: { root?: string; de
         }
       }
     }
-    return { id, file, folder, name, description, exposed: exposure.exposed, exposureReason: exposure.reason, extraFiles, scannedFiles, internalRefs }
+    return { id, file, folder, name, description, exposed: exposure.exposed, exposureReason: exposure.reason, extraFiles, scannedFiles, internalRefs, ...(sources ? { scope: definition.source!.scope, sourceRoot: definition.source!.root, overrides: definition.overrides ?? [] } : {}) }
   })
   const byEvidence = (a: Evidence, b: Evidence) => a.file.localeCompare(b.file) || a.line - b.line
   for (const relation of relations.values()) relation.evidence.sort(byEvidence)
   const graph: Graph = {
-    root, deep, skills, strayFolders, filesScanned, builtAt: Date.now(),
+    root, ...(sources ? { sources } : {}), deep, skills, strayFolders, filesScanned, builtAt: Date.now(),
     relations: [...relations.values()].sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target) || a.kind.localeCompare(b.kind)),
     diagnostics,
   }

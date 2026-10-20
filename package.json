@@ -28,7 +28,7 @@
     "engines": { "openchamber": ">=2.5.0" },
     "contributes": {
       "panel": { "id": "skill-graph", "name": "Skill Graph", "icon": "icon.svg", "entry": "panel/index.html" },
-      "page": { "entry": "panel/index.html", "title": "Skill Graph" },
+      "capabilities": ["files"],
       "filesystem": ["~/.config/opencode/skills", "~/.config/opencode/skills/**"]
     }
   }

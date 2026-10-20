@@ -4,7 +4,7 @@
 
 ![Skill Graph showing an example library, with exposed indexes connected to hidden specialist skills and a selected skill's references in the inspector.](docs/skill-graph.png)
 
-*An example skill library in the extension's full-screen view. Select a skill to follow its connections and inspect the source behind each link.*
+*An example skill library in the extension's maximized panel. Select a skill to follow its connections and inspect the source behind each link.*
 
 As a skill library grows, it gets harder to tell which instructions the agent sees up front, which it loads later, and which it may never find. Skill Graph gives you a map of that library inside [OpenChamber](https://openchamber.dev).
 
@@ -19,7 +19,11 @@ It's useful when you're writing or reorganizing OpenCode skills and want to:
 
 The graph follows written references, not model behavior. It doesn't predict which skill an agent will choose, and it doesn't need an AI API or send your skill contents anywhere.
 
-**Current scope:** the local `~/.config/opencode/skills` folder. Project-local skills, other skill directories, and overrides across directories aren't included yet.
+**Project-aware:** combines the server's `~/.config/opencode/skills` with `.opencode/skills`, `.claude/skills`, and `.agents/skills` under the active directory. Blue nodes mark **Global** skills; orange nodes mark **Project** skills, with labeled badges in the inspector. Filled versus hollow still means exposed versus hidden. Switching projects or worktrees refreshes the graph and clears the previous selection. With no project open, it shows global skills only.
+
+When scanned sources define the same ID, the graph shows the effective definition and lists overridden files in the inspector. Following OpenCode V2 precedence, project `.opencode` wins over native global skills, which win over project `.agents`, then `.claude` skills.
+
+**Scope limits:** ancestor directories outside the active directory, global compatibility folders, configured extra directories or HTTP catalogs, built-in skills, and agent permission rules are not inspected. The graph is a map of the scanned sources, not a complete runtime inventory.
 
 ## Install
 
@@ -34,10 +38,10 @@ npm run package
 
 1. In OpenChamber, open **Settings → Extensions → Add**.
 2. Paste the absolute path to your cloned `openchamber-skill-graph` folder, or select the generated `dist/openchamber-skill-graph.zip`.
-3. Approve access to `~/.config/opencode/skills` and its contents.
-4. Open **Skill Graph** from the extension rail. Use the expand button or the **Extension pages** menu for more room.
+3. Approve global skills access and access to files in the active project. Updating an older installation may ask for the added project-files permission.
+4. Open **Skill Graph** from the extension rail. Use its maximize button for more room. There is no separate Extension pages entry.
 
-The extension only reads files. OpenChamber's filesystem permission also permits writes within the approved folder, but Skill Graph does not use that ability. It doesn't change your skills or run a background service.
+The extension only reads files. OpenChamber's permissions technically also permit writes, and the project-files grant covers the active project, not just its skills folders. Skill Graph only scans the skill sources listed above and never writes files. It doesn't change your skills or run a background service.
 
 The source checkout must be built before installation. If you install from the folder, rebuild and reopen the panel after updating it. If you install the ZIP, install a newly built ZIP to update.
 

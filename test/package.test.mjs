@@ -16,10 +16,11 @@ async function checkManifest(directory) {
   assert.equal(parsed.ok, true, parsed.message)
   const { contributes } = parsed.manifest
   assert.equal(contributes.panel.id, "skill-graph")
-  // Read access to the skills tree only: no service, network, or project files.
+  // Global skills plus project files, still no service or network.
   assert.deepEqual(contributes.filesystem, ["~/.config/opencode/skills", "~/.config/opencode/skills/**"])
   assert.equal(contributes.service, undefined)
-  assert.equal(contributes.capabilities, undefined)
+  assert.deepEqual(contributes.capabilities, ["files"])
+  assert.equal(contributes.page, undefined, "rail maximize is enough; no separate page launcher")
   for (const file of [contributes.panel.entry, contributes.panel.icon, "panel/main.js", "panel/styles.css"]) await access(new URL(file, directory))
 }
 

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { test } from "node:test"
-import { buildGraph, edgeClass, extractReferences, fingerprint, resolveExposure } from "../graph.ts"
+import { buildGraph, edgeClass, extractReferences, fingerprint, resolveExposure, projectSources, sourcesFingerprint, SKILLS_ROOT } from "../graph.ts"
 import { nodeFiles } from "../report.ts"
 
 // One fixture per failure mode the panel should diagnose.
@@ -94,6 +94,78 @@ test("fingerprint changes when a skill or folder changes", () => withFixture(asy
   await mkdir(join(root, "new-folder"))
   assert.notEqual(await fingerprint(nodeFiles, root), edited)
 }))
+
+const skillText = (id, body = "", hidden = false) => `---\nname: ${id}\ndescription: ${id}\ndisable-model-invocation: ${hidden}\n---\n${body}`
+function memoryFiles(contents) {
+  return {
+    async listDir(path) {
+      const entries = new Map()
+      for (const file of Object.keys(contents)) {
+        if (!file.startsWith(`${path}/`)) continue
+        const tail = file.slice(path.length + 1)
+        entries.set(tail.split("/")[0], { name: tail.split("/")[0], kind: tail.includes("/") ? "directory" : "file" })
+      }
+      if (!entries.size) throw Object.assign(new Error(`Missing ${path}`), { code: "NOT_FOUND" })
+      return [...entries.values()]
+    },
+    async readFile(path) { assert.ok(path in contents, path); return contents[path] },
+    async stat(path) { return { kind: "file", mtime: 1, size: contents[path].length } },
+  }
+}
+
+test("project sources follow V2 precedence with qualified provenance and cross-source mentions", async () => {
+  const contents = {
+    [`${SKILLS_ROOT}/index/SKILL.md`]: skillText("index", "`local` and `shared`"),
+    [`${SKILLS_ROOT}/index/shadow/SKILL.md`]: skillText("shadow", "`global-only`"),
+    [`${SKILLS_ROOT}/shared/SKILL.md`]: skillText("shared", "`global-only`"),
+    [`${SKILLS_ROOT}/global-only/SKILL.md`]: skillText("global-only"),
+    ".claude/skills/shared/SKILL.md": skillText("shared"),
+    ".agents/skills/shared/SKILL.md": skillText("shared"),
+    ".opencode/skills/shared/SKILL.md": skillText("shared", "`local`", true),
+    ".opencode/skills/shadow/SKILL.md": skillText("shadow"),
+    ".opencode/skills/local/SKILL.md": skillText("local", "[shared](../shared/SKILL.md) and [global](~/.config/opencode/skills/global-only/SKILL.md)", true),
+    ".opencode/skills/skill.md": skillText("skill"),
+    ".opencode/skills/orphan/notes.md": "stray",
+    ".opencode/skills/container/nested/SKILL.md": skillText("nested"),
+  }
+  const files = memoryFiles(contents)
+  const graph = await buildGraph(files, { sources: projectSources("/project"), deep: true })
+  const skills = new Map(graph.skills.map((skill) => [skill.id, skill]))
+  assert.equal(skills.size, 7)
+  assert.equal(skills.get("shared").scope, "project")
+  assert.equal(skills.get("shared").file, ".opencode/skills/shared/SKILL.md")
+  assert.equal(skills.get("shared").exposed, false)
+  assert.deepEqual(skills.get("shared").overrides, [".claude/skills/shared/SKILL.md", ".agents/skills/shared/SKILL.md", `${SKILLS_ROOT}/shared/SKILL.md`])
+  assert.equal(skills.get("index").scope, "global")
+  assert.ok(graph.relations.some((edge) => edge.source === "index" && edge.target === "local"))
+  assert.ok(!graph.relations.some((edge) => edge.source === "shared" && edge.target === "global-only"), "overridden bodies must not contribute edges")
+  assert.ok(!graph.relations.some((edge) => edge.source === "index" && edge.target === "global-only"), "a shadowed nested definition must not be scanned as parent supporting Markdown")
+  assert.ok(graph.relations.some((edge) => edge.source === "local" && edge.target === "global-only" && edge.kind === "path"))
+  assert.deepEqual(graph.relations.find((edge) => edge.source === "local" && edge.target === "shared").evidence.map((item) => item.file), [".opencode/skills/local/SKILL.md"])
+  assert.ok(!graph.diagnostics.some((item) => item.code === "unreachable" && ["local", "shared"].includes(item.subject)))
+  assert.ok(!graph.diagnostics.some((item) => item.code === "skill-md-case" && item.file === ".opencode/skills/skill.md"))
+  assert.ok(!graph.diagnostics.some((item) => item.code === "nested-skill" && item.subject === "local"))
+  assert.deepEqual(graph.strayFolders.map((folder) => folder.path), [".opencode/skills/orphan"])
+  // The global OpenCode folder wins over project compatibility sources.
+  delete contents[".opencode/skills/shared/SKILL.md"]
+  const fallback = await buildGraph(files, { sources: projectSources("/project") })
+  assert.equal(fallback.skills.find((skill) => skill.id === "shared").scope, "global")
+})
+
+test("optional sources can appear later; errors other than missing roots are not suppressed", async () => {
+  const contents = {}
+  const files = memoryFiles(contents)
+  const sources = projectSources("/project")
+  const before = await sourcesFingerprint(files, sources)
+  assert.equal((await buildGraph(files, { sources })).skills.length, 0)
+  contents[".opencode/skills/new.md"] = skillText("new")
+  assert.notEqual(await sourcesFingerprint(files, sources), before)
+  assert.equal((await buildGraph(files, { sources: projectSources(null) })).skills.length, 0, "no directory means global only")
+  const denied = { ...files, async listDir() { throw Object.assign(new Error("Denied"), { code: "NOT_GRANTED" }) } }
+  await assert.rejects(buildGraph(denied, { sources }), /Denied/)
+  const brokenChild = { ...files, async listDir(path) { if (path.endsWith("/child")) throw Object.assign(new Error("Child vanished"), { code: "NOT_FOUND" }); return [{ name: "child", kind: "directory" }] } }
+  await assert.rejects(buildGraph(brokenChild, { sources: [{ root: "root", scope: "project", optional: true }] }), /Child vanished/)
+})
 
 const referenceTree = {
   ids: new Set(["source", "target"]),
