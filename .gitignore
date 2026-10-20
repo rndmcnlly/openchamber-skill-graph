@@ -1,0 +1,4 @@
+node_modules/
+panel/main.js
+dist/
+.openchamber/

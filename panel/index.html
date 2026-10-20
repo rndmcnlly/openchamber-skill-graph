@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Skill Graph</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header id="toolbar">
+      <div id="search"></div>
+      <div id="switches"></div>
+      <div id="actions"></div>
+    </header>
+    <div id="legend" role="group" aria-label="Relation types (click to show or hide)"></div>
+    <p id="summary" aria-live="polite">Reading skills…</p>
+    <div id="banner"></div>
+    <main id="layout">
+      <section id="canvas" aria-label="Skill graph. Drag to pan, scroll to zoom, select a skill to inspect it.">
+        <svg id="graph" role="group" aria-label="Skill graph"></svg>
+        <div id="zoom"></div>
+      </section>
+      <aside id="inspector" aria-label="Details" tabindex="-1"></aside>
+    </main>
+    <script src="main.js"></script>
+  </body>
+</html>

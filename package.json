@@ -1,0 +1,35 @@
+{
+  "name": "openchamber-skill-graph",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenChamber panel that maps references between local OpenCode skills, with exposure and provenance",
+  "repository": { "type": "git", "url": "https://github.com/rndmcnlly/openchamber-skill-graph.git" },
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "package": "npm run build && node package.mjs",
+    "report": "node report.ts",
+    "dev": "node dev.mjs"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.5.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": { "openchamber": ">=2.5.0" },
+    "contributes": {
+      "panel": { "id": "skill-graph", "name": "Skill Graph", "icon": "icon.svg", "entry": "panel/index.html" },
+      "page": { "entry": "panel/index.html", "title": "Skill Graph" },
+      "filesystem": ["~/.config/opencode/skills", "~/.config/opencode/skills/**"]
+    }
+  }
+}
